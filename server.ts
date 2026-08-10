@@ -33,9 +33,15 @@ app.use(express.urlencoded({ extended: true }));
 // PostgreSQL Connection
 const connectionString = process.env.DATABASE_URL || 'postgresql://postgres.jlegxtwwllpbjudsbgtp:59aa56193be5bdab4e78060d6feeaf81@aws-0-ca-central-1.pooler.supabase.com:6543/postgres';
 
+// SSL é controlado explicitamente por DB_SSL (default: desligado).
+// Bancos internos na mesma rede Docker (ex.: nosso Postgres na VPS) normalmente
+// não têm SSL configurado. Para bancos externos gerenciados (ex.: Supabase),
+// defina DB_SSL=true no ambiente do serviço.
+const dbSsl = process.env.DB_SSL === 'true';
+
 const pool = new pg.Pool({
   connectionString,
-  ssl: connectionString.includes('localhost') ? false : { rejectUnauthorized: false }
+  ssl: dbSsl ? { rejectUnauthorized: false } : false
 });
 
 // Row Mappers
