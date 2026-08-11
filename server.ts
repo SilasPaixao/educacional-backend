@@ -377,63 +377,72 @@ async function sendNotificationEmail(to: string, subject: string, text: string, 
   const senderEmail = process.env.BREVO_SENDER_EMAIL || 'nao-responda@serrinha.ba.gov.br';
   const senderName = process.env.BREVO_SENDER_NAME || 'Secretaria de Educação de Serrinha';
 
-  if (apiKey) {
-    try {
-      const response = await fetch('https://api.brevo.com/v3/smtp/email', {
-        method: 'POST',
-        headers: {
-          'accept': 'application/json',
-          'api-key': apiKey,
-          'content-type': 'application/json'
-        },
-        body: JSON.stringify({
-          sender: { name: senderName, email: senderEmail },
-          to: [{ email: to }],
-          subject,
-          htmlContent: html,
-          textContent: text
-        })
-      });
+  if (!apiKey) {
+    console.error(`[Email NÃO enviado] BREVO_API_KEY não está configurada no ambiente do backend. To: ${to} | Subject: ${subject}`);
+    return;
+  }
 
-      if (response.ok) {
-        console.log(`[Email Sent via Brevo API] To: ${to} | Subject: ${subject}`);
-        return;
-      }
-    } catch (apiErr) {
-      // Ignore API connection error and fallback to local simulation
+  try {
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'accept': 'application/json',
+        'api-key': apiKey,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        sender: { name: senderName, email: senderEmail },
+        to: [{ email: to }],
+        subject,
+        htmlContent: html,
+        textContent: text
+      })
+    });
+
+    if (response.ok) {
+      console.log(`[Email Sent via Brevo API] To: ${to} | Subject: ${subject}`);
+      return;
     }
 
-    const smtpUser = process.env.BREVO_SMTP_USER;
-    const smtpKey = process.env.BREVO_SMTP_KEY || process.env.BREVO_SMTP_PASS;
+    // Não deixa o erro passar em silêncio: loga o motivo real retornado pela Brevo
+    // (ex.: remetente não verificado, chave inválida, limite excedido, etc.)
+    const errorBody = await response.text().catch(() => '');
+    console.error(`[Brevo API Error] Status: ${response.status} | To: ${to} | Subject: ${subject} | Response: ${errorBody}`);
+  } catch (apiErr: any) {
+    console.error(`[Brevo API - Falha de conexão] To: ${to} | Subject: ${subject} | Erro: ${apiErr?.message || apiErr}`);
+  }
 
-    if (smtpUser && smtpKey) {
-      try {
-        const transporter = nodemailer.createTransport({
-          host: 'smtp-relay.brevo.com',
-          port: 587,
-          secure: false,
-          auth: {
-            user: smtpUser,
-            pass: smtpKey
-          }
-        });
+  // Fallback opcional via SMTP da Brevo, caso configurado (BREVO_SMTP_USER / BREVO_SMTP_KEY)
+  const smtpUser = process.env.BREVO_SMTP_USER;
+  const smtpKey = process.env.BREVO_SMTP_KEY || process.env.BREVO_SMTP_PASS;
 
-        await transporter.sendMail({
-          from: `"${senderName}" <${senderEmail}>`,
-          to,
-          subject,
-          text,
-          html
-        });
-        console.log(`[Email Sent via Brevo SMTP] To: ${to} | Subject: ${subject}`);
-        return;
-      } catch (smtpErr) {
-        // Fallback to simulation log below
-      }
+  if (smtpUser && smtpKey) {
+    try {
+      const transporter = nodemailer.createTransport({
+        host: 'smtp-relay.brevo.com',
+        port: 587,
+        secure: false,
+        auth: {
+          user: smtpUser,
+          pass: smtpKey
+        }
+      });
+
+      await transporter.sendMail({
+        from: `"${senderName}" <${senderEmail}>`,
+        to,
+        subject,
+        text,
+        html
+      });
+      console.log(`[Email Sent via Brevo SMTP] To: ${to} | Subject: ${subject}`);
+      return;
+    } catch (smtpErr: any) {
+      console.error(`[Brevo SMTP Error] To: ${to} | Subject: ${subject} | Erro: ${smtpErr?.message || smtpErr}`);
     }
   }
 
-  console.log(`[Email Simulated] To: ${to}\nSubject: ${subject}\nContent:\n${text}`);
+  console.error(`[Email NÃO enviado - todas as tentativas falharam] To: ${to} | Subject: ${subject}`);
 }
 
 // S3 / MinIO Storage Helper
@@ -716,6 +725,13 @@ app.put('/api/director/email', async (req, res) => {
       return res.status(404).json({ error: 'Escola não encontrada.' });
     }
 
+    if (email) {
+      const existingEmail = await dbGetSchoolByEmail(email);
+      if (existingEmail && existingEmail.id !== schoolId) {
+        return res.status(400).json({ error: 'Este e-mail já está cadastrado para outra escola/diretor(a). Informe outro e-mail.' });
+      }
+    }
+
     await dbUpdateSchoolEmail(schoolId, email);
     school.contactEmail = email;
 
@@ -797,6 +813,11 @@ app.post('/api/admin/register', async (req, res) => {
     const existing = await dbGetAdminByUsername(username);
     if (existing) {
       return res.status(400).json({ error: 'Nome de usuário já cadastrado.' });
+    }
+
+    const existingEmail = await dbGetAdminByEmail(email);
+    if (existingEmail) {
+      return res.status(400).json({ error: 'Este e-mail já está cadastrado para outra conta de administrador. Informe outro e-mail.' });
     }
 
     const allAdmins = await dbGetAllAdmins();
@@ -953,6 +974,13 @@ app.post('/api/admin/schools', async (req, res) => {
     const existing = await dbGetSchoolByUsername(directorUsername);
     if (existing) {
       return res.status(400).json({ error: 'Nome de usuário de diretor já em uso.' });
+    }
+
+    if (contactEmail) {
+      const existingEmail = await dbGetSchoolByEmail(contactEmail);
+      if (existingEmail) {
+        return res.status(400).json({ error: 'Este e-mail já está cadastrado para outra escola/diretor(a). Informe outro e-mail.' });
+      }
     }
 
     const schoolId = `sch-${Date.now()}`;
