@@ -192,7 +192,7 @@ async function dbCreateApplication(data: any) {
       data.lastGradeCompleted || '',
       data.enteringGrade || '',
       data.birthDate || null,
-      data.age || null,
+      data.age ?? null,
       data.gender || '',
       data.raceColor || '',
       data.motherName || '',
@@ -342,6 +342,52 @@ async function dbSaveAnnouncement(title: string, content: string) {
     console.warn('[DB Save Announcement Warning]', err);
   }
   return memoryAnnouncement;
+}
+
+// Mensagem exibida ao público quando o admin encerra o período de matrículas
+const ENROLLMENT_LOCKED_MESSAGE =
+  'Período de Matrículas encerrado (para mais informações entre em contato com a escola ou a Secretaria de Educação. Obrigado!)';
+
+let memoryEnrollmentLocked = false;
+
+async function dbGetEnrollmentLocked(): Promise<boolean> {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS system_settings (
+        key VARCHAR(100) PRIMARY KEY,
+        value JSONB,
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    const res = await pool.query("SELECT value FROM system_settings WHERE key = 'enrollment_lock'");
+    if (res.rows.length > 0 && res.rows[0].value) {
+      memoryEnrollmentLocked = !!res.rows[0].value.locked;
+    }
+  } catch (err) {
+    console.warn('[DB Settings Warning]', err);
+  }
+  return memoryEnrollmentLocked;
+}
+
+async function dbSetEnrollmentLocked(locked: boolean): Promise<boolean> {
+  memoryEnrollmentLocked = locked;
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS system_settings (
+        key VARCHAR(100) PRIMARY KEY,
+        value JSONB,
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+    `);
+    await pool.query(`
+      INSERT INTO system_settings (key, value, updated_at)
+      VALUES ('enrollment_lock', $1, NOW())
+      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();
+    `, [JSON.stringify({ locked })]);
+  } catch (err) {
+    console.warn('[DB Save Enrollment Lock Warning]', err);
+  }
+  return memoryEnrollmentLocked;
 }
 
 async function dbRunHousekeeping() {
@@ -542,17 +588,41 @@ app.get('/api/schools', async (req, res) => {
 app.post('/api/applications', async (req, res) => {
   try {
     await dbRunHousekeeping();
+
+    if (await dbGetEnrollmentLocked()) {
+      return res.status(403).json({ error: ENROLLMENT_LOCKED_MESSAGE });
+    }
+
     const data = req.body;
 
-    if (data.modality === 'eja') {
-      const birthDate = new Date(data.birthDate);
-      const today = new Date();
-      let age = today.getFullYear() - birthDate.getFullYear();
-      const monthDiff = today.getMonth() - birthDate.getMonth();
-      if (monthDiff < 0 || (monthDiff === 0 && today.getDate() < birthDate.getDate())) {
-        age--;
-      }
+    // Valida a data de nascimento antes de qualquer cálculo/gravação:
+    // evita registros com data incompatível (ex.: hoje ou no futuro), que geravam
+    // idade nula/negativa e quebravam a constraint NOT NULL da coluna "age".
+    const parsedBirthDate = new Date(`${data.birthDate}T00:00:00`);
+    const todayAtMidnight = new Date();
+    todayAtMidnight.setHours(0, 0, 0, 0);
 
+    if (!data.birthDate || isNaN(parsedBirthDate.getTime())) {
+      return res.status(400).json({
+        error: 'Data de nascimento inválida ou não informada. Verifique o campo e tente novamente.'
+      });
+    }
+    if (parsedBirthDate >= todayAtMidnight) {
+      return res.status(400).json({
+        error: 'Data de nascimento inválida: não pode ser hoje nem uma data futura. Corrija o dia, mês e ano informados.'
+      });
+    }
+
+    // Idade sempre calculada no servidor a partir da data de nascimento validada
+    // (não confiamos apenas no valor enviado pelo cliente).
+    let age = todayAtMidnight.getFullYear() - parsedBirthDate.getFullYear();
+    const monthDiff = todayAtMidnight.getMonth() - parsedBirthDate.getMonth();
+    if (monthDiff < 0 || (monthDiff === 0 && todayAtMidnight.getDate() < parsedBirthDate.getDate())) {
+      age--;
+    }
+    data.age = age;
+
+    if (data.modality === 'eja') {
       if (data.enteringGrade?.includes('Fundamental') && age < 15) {
         return res.status(400).json({
           error: `Para ingressar no EJA Ensino Fundamental é necessário ter no mínimo 15 anos completos. (Idade informada: ${age} anos)`
@@ -767,11 +837,16 @@ app.get('/api/director/applications/:schoolId', async (req, res) => {
   }
 });
 
-// Director update application status (Homologar / Rejeitar)
+// Director update application status (Homologar / Rejeitar / Lista de Espera)
 app.patch('/api/director/applications/:protocol', async (req, res) => {
   try {
     const protocol = req.params.protocol;
     const { status, rejectionReason } = req.body;
+
+    const allowedStatuses = ['Cadastrado', 'Rejeitado', 'Lista de Espera'];
+    if (!allowedStatuses.includes(status)) {
+      return res.status(400).json({ error: 'Status inválido.' });
+    }
 
     const appItem = await dbUpdateApplicationStatus(protocol, status, rejectionReason);
     if (!appItem) {
@@ -780,14 +855,31 @@ app.patch('/api/director/applications/:protocol', async (req, res) => {
 
     if (appItem.email) {
       const subject = `Atualização de Status da Matrícula - Protocolo ${protocol}`;
-      const statusText = status === 'Cadastrado' ? 'HOMOLOGADO / CADASTRADO' : 'NÃO HOMOLOGADO';
-      const text = `Olá, ${appItem.studentName}!\n\nO status da sua solicitação de pré-matrícula (${protocol}) foi atualizado para: ${statusText}.\n${rejectionReason ? 'Motivo: ' + rejectionReason : ''}\n\nSecretaria Municipal de Educação de Serrinha-BA`;
+
+      let statusText = '';
+      let statusColor = '#dc2626';
+      let extraMessage = '';
+
+      if (status === 'Cadastrado') {
+        statusText = 'HOMOLOGADO / CADASTRADO';
+        statusColor = '#16a34a';
+      } else if (status === 'Lista de Espera') {
+        statusText = 'EM LISTA DE ESPERA';
+        statusColor = '#d97706';
+        extraMessage = 'No momento não há vagas disponíveis, porém sua solicitação está na lista de espera. Caso surja uma vaga (por desistência ou outro motivo), a escola poderá entrar em contato pelo telefone informado no cadastro.';
+      } else {
+        statusText = 'NÃO HOMOLOGADO';
+        statusColor = '#dc2626';
+      }
+
+      const text = `Olá, ${appItem.studentName}!\n\nO status da sua solicitação de pré-matrícula (${protocol}) foi atualizado para: ${statusText}.\n${rejectionReason ? 'Motivo: ' + rejectionReason + '\n' : ''}${extraMessage ? extraMessage + '\n' : ''}\nSecretaria Municipal de Educação de Serrinha-BA`;
       const html = `
         <div style="font-family: sans-serif; padding: 20px;">
           <h3>Atualização do Pedido de Matrícula</h3>
           <p>Olá, <strong>${appItem.studentName}</strong>,</p>
-          <p>Sua solicitação (Protocolo: <strong>${protocol}</strong>) foi atualizada para: <strong style="color: ${status === 'Cadastrado' ? '#16a34a' : '#dc2626'};">${statusText}</strong>.</p>
+          <p>Sua solicitação (Protocolo: <strong>${protocol}</strong>) foi atualizada para: <strong style="color: ${statusColor};">${statusText}</strong>.</p>
           ${rejectionReason ? `<p><strong>Motivo:</strong> ${rejectionReason}</p>` : ''}
+          ${extraMessage ? `<p>${extraMessage}</p>` : ''}
           <p>Consulte o portal para mais detalhes.</p>
         </div>
       `;
@@ -1034,6 +1126,30 @@ app.get('/api/announcement', async (req, res) => {
     res.json(data);
   } catch (err: any) {
     res.status(500).json({ error: 'Erro ao obter comunicado: ' + err.message });
+  }
+});
+
+// Public: consulta se o período de matrículas está encerrado (usado pela home antes de abrir o formulário)
+app.get('/api/enrollment-status', async (req, res) => {
+  try {
+    const locked = await dbGetEnrollmentLocked();
+    res.json({ locked, message: locked ? ENROLLMENT_LOCKED_MESSAGE : null });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Erro ao obter status das matrículas: ' + err.message });
+  }
+});
+
+// Admin: liga/desliga o bloqueio geral de matrículas para todas as escolas
+app.put('/api/admin/enrollment-lock', async (req, res) => {
+  try {
+    const { locked } = req.body;
+    if (typeof locked !== 'boolean') {
+      return res.status(400).json({ error: 'Valor inválido para "locked".' });
+    }
+    const updated = await dbSetEnrollmentLocked(locked);
+    res.json({ locked: updated, message: updated ? ENROLLMENT_LOCKED_MESSAGE : null });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Erro ao atualizar status das matrículas: ' + err.message });
   }
 });
 
