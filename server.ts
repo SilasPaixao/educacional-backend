@@ -148,6 +148,9 @@ async function dbUpdateSchoolEmail(id: string, email: string) {
   await pool.query('UPDATE schools SET contact_email = $2 WHERE id = $1', [id, email]);
 }
 
+// Modalidades válidas (mesmas usadas pelo frontend), para validar importações em lote
+const ALLOWED_MODALITIES = ['educacao-infantil', 'ensino-fundamental', 'ensino-medio', 'eja'];
+
 async function dbCreateSchool(s: any) {
   await pool.query(
     `INSERT INTO schools (id, name, modalities, director_username, director_password_hash, recpswrec, contact_phone, contact_email, address, director_name, created_at)
@@ -1094,6 +1097,109 @@ app.post('/api/admin/schools', async (req, res) => {
     res.status(201).json({ message: 'Escola cadastrada com sucesso!' });
   } catch (err: any) {
     res.status(500).json({ error: 'Erro ao cadastrar escola: ' + err.message });
+  }
+});
+
+// Bulk school import (admin uploads a JSON file with an array of schools)
+app.post('/api/admin/schools/bulk', async (req, res) => {
+  try {
+    const { schools } = req.body;
+
+    if (!Array.isArray(schools) || schools.length === 0) {
+      return res.status(400).json({ error: 'Envie um array "schools" com pelo menos uma escola.' });
+    }
+    if (schools.length > 200) {
+      return res.status(400).json({ error: 'Limite de 200 escolas por importação. Divida o arquivo em lotes menores.' });
+    }
+
+    const results: { index: number; name: string; status: 'created' | 'error'; error?: string }[] = [];
+
+    // Evita duplicar usuário/e-mail dentro do próprio arquivo (além da checagem contra o banco)
+    const seenUsernames = new Set<string>();
+    const seenEmails = new Set<string>();
+
+    for (let i = 0; i < schools.length; i++) {
+      const raw = schools[i] || {};
+
+      // Aceita tanto os nomes de coluna do banco (snake_case) quanto os nomes usados pela API (camelCase)
+      const name = raw.name || raw.school_name;
+      const modalities = raw.modalities;
+      const directorUsername = String(raw.directorUsername || raw.director_username || '').trim();
+      const directorPasswordPlain = raw.directorPassword || raw.director_password;
+      const directorPasswordHashInput = raw.directorPasswordHash || raw.director_password_hash;
+      const contactPhone = raw.contactPhone || raw.contact_phone || '';
+      const contactEmail = String(raw.contactEmail || raw.contact_email || '').trim();
+      const address = raw.address || '';
+      const directorName = raw.directorName || raw.director_name || 'Diretor(a)';
+
+      try {
+        if (!name || !Array.isArray(modalities) || modalities.length === 0 || !directorUsername || (!directorPasswordPlain && !directorPasswordHashInput)) {
+          throw new Error('Campos obrigatórios ausentes (name, modalities, director_username, director_password).');
+        }
+
+        const invalidModalities = modalities.filter((m: string) => !ALLOWED_MODALITIES.includes(m));
+        if (invalidModalities.length > 0) {
+          throw new Error(`Modalidade(s) inválida(s): ${invalidModalities.join(', ')}. Válidas: ${ALLOWED_MODALITIES.join(', ')}.`);
+        }
+
+        const usernameKey = directorUsername.toLowerCase();
+        if (seenUsernames.has(usernameKey)) {
+          throw new Error('Nome de usuário de diretor duplicado dentro do próprio arquivo.');
+        }
+        const existingUsername = await dbGetSchoolByUsername(directorUsername);
+        if (existingUsername) {
+          throw new Error('Nome de usuário de diretor já em uso no sistema.');
+        }
+
+        if (contactEmail) {
+          const emailKey = contactEmail.toLowerCase();
+          if (seenEmails.has(emailKey)) {
+            throw new Error('E-mail duplicado dentro do próprio arquivo.');
+          }
+          const existingEmail = await dbGetSchoolByEmail(contactEmail);
+          if (existingEmail) {
+            throw new Error('E-mail já cadastrado para outra escola/diretor(a).');
+          }
+        }
+
+        const schoolId = raw.id || `sch-${Date.now()}-${i}`;
+        const directorPasswordHash = directorPasswordHashInput || bcrypt.hashSync(String(directorPasswordPlain), 10);
+
+        await dbCreateSchool({
+          id: schoolId,
+          name,
+          modalities,
+          directorUsername,
+          directorPasswordHash,
+          // Só guardamos a senha em texto puro (para recuperação por e-mail) quando ela foi enviada em texto puro.
+          // Se só veio o hash pronto, não há como recuperar o valor original, então recpswrec fica vazio.
+          recpswrec: directorPasswordPlain ? String(directorPasswordPlain) : '',
+          contactPhone,
+          contactEmail,
+          address,
+          directorName
+        });
+
+        seenUsernames.add(usernameKey);
+        if (contactEmail) seenEmails.add(contactEmail.toLowerCase());
+
+        results.push({ index: i, name, status: 'created' });
+      } catch (itemErr: any) {
+        results.push({ index: i, name: name || `(item ${i + 1})`, status: 'error', error: itemErr.message });
+      }
+    }
+
+    const createdCount = results.filter((r) => r.status === 'created').length;
+    const errorCount = results.length - createdCount;
+
+    res.status(createdCount === 0 ? 400 : 200).json({
+      message: `${createdCount} escola(s) cadastrada(s) com sucesso${errorCount > 0 ? `, ${errorCount} com erro (veja detalhes)` : ''}.`,
+      created: createdCount,
+      failed: errorCount,
+      results
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Erro ao importar escolas: ' + err.message });
   }
 });
 
